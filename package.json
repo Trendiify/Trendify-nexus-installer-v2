@@ -1,0 +1,15 @@
+```json
+{
+  "name": "trendify-nexus-installer-v2",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Trendify Nexus Installer",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
+```
