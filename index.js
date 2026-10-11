@@ -790,6 +790,58 @@ export default {
       const webhookSecret = randomHex(32);
       const uuid = crypto.randomUUID();
 
+      ```js
+      /* Create shared D1 database for users and subscriptions */
+      const databaseName = "nexus-" + randomHex(6);
+
+      const databaseResult = await cf(
+        "/accounts/" + accountId + "/d1/database",
+        cloudflareToken,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: databaseName,
+            primary_location_hint: "weur"
+          })
+        }
+      );
+
+      const databaseId = databaseResult.uuid || databaseResult.id;
+
+      if (!databaseId) {
+        throw new Error("ساخت دیتابیس D1 ناموفق بود؛ شناسه دیتابیس دریافت نشد.");
+      }
+
+      const schemaSql = `
+        CREATE TABLE IF NOT EXISTS users (
+          uuid TEXT PRIMARY KEY,
+          telegram_id TEXT,
+          name TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          expires_at INTEGER,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_telegram
+        ON users(telegram_id);
+
+        CREATE INDEX IF NOT EXISTS idx_users_enabled
+        ON users(enabled);
+      `;
+
+      await cf(
+        "/accounts/" + accountId + "/d1/database/" +
+          databaseId + "/query",
+        cloudflareToken,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sql: schemaSql })
+        }
+      );
+```
+
       /* Create GitHub repository */
       const createRepo = await github(
         "https://api.github.com/user/repos",
