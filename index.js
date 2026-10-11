@@ -478,8 +478,20 @@ async function handleVLESS(request, env) {
 
     const parsed = parseVLESS(bytes);
 
-    if (parsed.uuid.toLowerCase() !== String(env.UUID).toLowerCase()) {
-      throw new Error("UUID mismatch");
+        const user = await env.DB.prepare(
+      `SELECT uuid, enabled, expires_at
+       FROM users
+       WHERE uuid = ?
+       LIMIT 1`
+    ).bind(parsed.uuid.toLowerCase()).first();
+
+    if (
+      !user ||
+      Number(user.enabled) !== 1 ||
+      (user.expires_at != null &&
+       Number(user.expires_at) <= Math.floor(Date.now() / 1000))
+    ) {
+      throw new Error("User missing, disabled, or expired");
     }
 
     await connectRelay(parsed);
@@ -646,6 +658,7 @@ export default {
    CLOUDFLARE WORKER DEPLOY
 ========================= */
 
+```js
 async function deployWorker(
   accountId,
   token,
@@ -654,40 +667,78 @@ async function deployWorker(
   bindings,
   secretNames = []
 ) {
-  const metadata = {
-    main_module: "index.js",
-    compatibility_date: "2026-10-10",
-    bindings: Object.entries(bindings).map(([name, value]) => ({
+  const workerBindings = Object.entries(bindings).map(([name, value]) => {
+    // D1 database binding
+    if (
+      value &&
+      typeof value === "object" &&
+      value.type === "d1" &&
+      value.id
+    ) {
+      return {
+        type: "d1",
+        name,
+        id: String(value.id),
+      };
+    }
+
+    // Text and secret bindings
+    return {
       type: secretNames.includes(name) ? "secret_text" : "plain_text",
       name,
       text: String(value),
-    })),
+    };
+  });
+
+  const metadata = {
+    main_module: "index.js",
+    compatibility_date: "2026-10-10",
+    bindings: workerBindings,
   };
 
   const form = new FormData();
+
   form.append("metadata", JSON.stringify(metadata));
   form.append(
     "index.js",
-    new Blob([source], { type: "application/javascript+module" }),
+    new Blob([source], {
+      type: "application/javascript+module",
+    }),
     "index.js"
   );
 
   await cf(
-    "/accounts/" + accountId + "/workers/scripts/" + workerName + "/content",
-    token,
-    { method: "PUT", body: form }
-  );
-
-  await cf(
-    "/accounts/" + accountId + "/workers/scripts/" + workerName + "/subdomain",
+    "/accounts/" +
+      accountId +
+      "/workers/scripts/" +
+      workerName +
+      "/content",
     token,
     {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: true }),
+      body: form,
+    }
+  );
+
+  await cf(
+    "/accounts/" +
+      accountId +
+      "/workers/scripts/" +
+      workerName +
+      "/subdomain",
+    token,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        enabled: true,
+      }),
     }
   );
 }
+```
 
 /* =========================
    INSTALLER API
@@ -841,6 +892,26 @@ export default {
         }
       );
 ```
+            await cf(
+        "/accounts/" + accountId + "/d1/database/" +
+          databaseId + "/query",
+        cloudflareToken,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sql: `INSERT OR IGNORE INTO users
+                  (uuid, telegram_id, name, enabled, expires_at, created_at)
+                  VALUES (?, ?, ?, 1, NULL, ?)`,
+            params: [
+              uuid.toLowerCase(),
+              telegramAdminId,
+              "Initial",
+              Math.floor(Date.now() / 1000)
+            ]
+          })
+        }
+      );
 
       /* Create GitHub repository */
       const createRepo = await github(
@@ -929,13 +1000,14 @@ export default {
         cloudflareToken,
         workerName,
         GATEWAY_SOURCE,
-        {
+       {
   UUID: uuid,
   RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
   RELAY_PORT: "443",
   RELAY_SECRET: relaySecret,
   GATEWAY_ID: gatewayId,
   GATEWAY_REGION: "eu",
+  DB: { type: "d1", id: databaseId },
 },
 ["UUID", "RELAY_SECRET"]
       );
