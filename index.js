@@ -11,7 +11,7 @@ function json(data, status = 200) {
       ...CORS,
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
-    },
+  },
   });
 }
 
@@ -40,7 +40,7 @@ async function github(url, token, options = {}) {
       Authorization: "Bearer " + token,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "Installer",
+      "User-Agent": "Trendify-Nexus-Installer",
       ...(options.headers || {}),
     },
   });
@@ -64,7 +64,10 @@ async function cf(path, token, options = {}) {
   try {
     data = JSON.parse(raw);
   } catch {
-    data = { success: false, errors: [{ message: raw }] };
+    data = {
+      success: false,
+      errors: [{ message: raw || "Invalid Cloudflare response" }],
+    };
   }
 
   if (!response.ok || data.success === false) {
@@ -72,7 +75,9 @@ async function cf(path, token, options = {}) {
       .map(x => x.message || JSON.stringify(x))
       .join("; ");
 
-    throw new Error("Cloudflare API: " + (details || response.status));
+    throw new Error(
+      "Cloudflare API: " + (details || response.status)
+    );
   }
 
   return data.result;
@@ -90,15 +95,18 @@ async function putRepoFile(owner, repo, path, content, token) {
     sha = (await existing.json()).sha;
   } else if (existing.status !== 404) {
     throw new Error(
-      "GitHub read failed (" + path + "): " + await existing.text()
+      "GitHub read failed (" + path + "): " +
+      await existing.text()
     );
   }
 
   const response = await github(url, token, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
-      message: "Create relay deployment files",
+      message: "Create Trendify Nexus Relay files",
       content: base64UTF8(content),
       ...(sha ? { sha } : {}),
     }),
@@ -106,14 +114,15 @@ async function putRepoFile(owner, repo, path, content, token) {
 
   if (!response.ok) {
     throw new Error(
-      "GitHub upload failed (" + path + "): " + await response.text()
+      "GitHub upload failed (" + path + "): " +
+      await response.text()
     );
   }
 }
 
-/* =========================
-   TCP RELAY
-========================= */
+/* =====================================================
+   1. AUTHENTICATED TCP RELAY
+===================================================== */
 
 const RELAY_SOURCE = String.raw`
 import net from "node:net";
@@ -130,8 +139,16 @@ if (!SECRET) {
 
 const expectedSecret = Buffer.from(SECRET, "utf8");
 
-if (expectedSecret.length < 16 || expectedSecret.length > MAX_SECRET_LENGTH) {
+if (
+  expectedSecret.length < 16 ||
+  expectedSecret.length > MAX_SECRET_LENGTH
+) {
   console.error("Invalid RELAY_SECRET length");
+  process.exit(1);
+}
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  console.error("Invalid PORT");
   process.exit(1);
 }
 
@@ -144,16 +161,23 @@ const server = net.createServer(client => {
   let secretLength = 0;
   let hostLength = 0;
   let finished = false;
+  let connectTimer = null;
 
   const timer = setTimeout(() => {
-    if (stage !== "connected") client.destroy();
+    if (stage !== "connected") {
+      reject("Handshake timeout");
+    }
   }, 10000);
 
   function reject(reason) {
     if (finished) return;
+
     finished = true;
     clearTimeout(timer);
+    clearTimeout(connectTimer);
+
     console.log("REJECT:", reason);
+
     client.destroy();
     remote?.destroy();
   }
@@ -166,10 +190,14 @@ const server = net.createServer(client => {
     while (true) {
       if (stage === "secretLength") {
         if (buffer.length < 2) return;
+
         secretLength = buffer.readUInt16BE(0);
         buffer = buffer.subarray(2);
 
-        if (secretLength < 16 || secretLength > MAX_SECRET_LENGTH) {
+        if (
+          secretLength < 16 ||
+          secretLength > MAX_SECRET_LENGTH
+        ) {
           return reject("Invalid secret length");
         }
 
@@ -194,6 +222,7 @@ const server = net.createServer(client => {
 
       if (stage === "hostLength") {
         if (buffer.length < 2) return;
+
         hostLength = buffer.readUInt16BE(0);
         buffer = buffer.subarray(2);
 
@@ -207,9 +236,13 @@ const server = net.createServer(client => {
       if (stage === "target") {
         if (buffer.length < hostLength + 2) return;
 
-        const host = buffer.subarray(0, hostLength).toString("utf8");
+        const host = buffer
+          .subarray(0, hostLength)
+          .toString("utf8");
+
         const port = buffer.readUInt16BE(hostLength);
         const payload = buffer.subarray(hostLength + 2);
+
         buffer = Buffer.alloc(0);
         stage = "connecting";
 
@@ -224,6 +257,7 @@ const server = net.createServer(client => {
         }
 
         clearTimeout(timer);
+
         client.pause();
         client.removeListener("data", onData);
 
@@ -232,10 +266,15 @@ const server = net.createServer(client => {
           remote.setNoDelay(true);
 
           let acknowledged = false;
-          const connectTimer = setTimeout(() => {
+
+          connectTimer = setTimeout(() => {
             if (!acknowledged) {
               console.log("REMOTE CONNECT TIMEOUT:", host, port);
-              client.end(Buffer.from([1]));
+
+              if (!client.destroyed) {
+                client.end(Buffer.from([1]));
+              }
+
               remote.destroy();
             }
           }, 10000);
@@ -248,13 +287,17 @@ const server = net.createServer(client => {
 
             acknowledged = true;
             clearTimeout(connectTimer);
+
             stage = "connected";
+
             console.log("CONNECTED:", host, port);
 
-            // Signal successful destination connection to Gateway.
+            // Gateway expects 0 for success.
             client.write(Buffer.from([0]));
 
-            if (payload.length) remote.write(payload);
+            if (payload.length) {
+              remote.write(payload);
+            }
 
             client.pipe(remote);
             remote.pipe(client);
@@ -273,9 +316,11 @@ const server = net.createServer(client => {
           });
 
           remote.on("close", () => {
+            clearTimeout(connectTimer);
+
             if (!acknowledged && !client.destroyed) {
               client.end(Buffer.from([1]));
-            } else {
+            } else if (!client.destroyed) {
               client.destroy();
             }
           });
@@ -300,20 +345,23 @@ const server = net.createServer(client => {
   client.on("close", () => {
     finished = true;
     clearTimeout(timer);
+    clearTimeout(connectTimer);
     remote?.destroy();
   });
 });
 
-server.on("error", err => console.error("SERVER ERROR:", err));
+server.on("error", err => {
+  console.error("SERVER ERROR:", err);
+  process.exitCode = 1;
+});
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Authenticated TCP Relay listening on", PORT);
 });
 `;
-
-/* =========================
-   VLESS GATEWAY
-========================= */
+/* =====================================================
+   2. VLESS GATEWAY
+===================================================== */
 
 const GATEWAY_SOURCE = String.raw`
 import { connect } from "cloudflare:sockets";
@@ -336,7 +384,8 @@ function uuidFromBytes(bytes) {
   ).join("");
 
   return h.slice(0,8) + "-" + h.slice(8,12) + "-" +
-    h.slice(12,16) + "-" + h.slice(16,20) + "-" + h.slice(20,32);
+    h.slice(12,16) + "-" + h.slice(16,20) + "-" +
+    h.slice(20,32);
 }
 
 function decodeEarlyData(value) {
@@ -344,7 +393,7 @@ function decodeEarlyData(value) {
 
   try {
     let normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-    normalized += "=".repeat((4 - (normalized.length % 4)) % 4);
+    normalized += "=".repeat((4 - normalized.length % 4) % 4);
 
     const binary = atob(normalized);
 
@@ -355,7 +404,9 @@ function decodeEarlyData(value) {
 }
 
 async function bytesOf(data) {
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
 
   if (ArrayBuffer.isView(data)) {
     return new Uint8Array(
@@ -440,11 +491,58 @@ function parseVLESS(bytes) {
 
   return {
     version,
-    uuid,
+    uuid: uuid.toLowerCase(),
     host,
     port,
     payload: bytes.slice(i)
   };
+}
+
+async function authorizeUUID(env, uuid) {
+  const normalizedUUID = String(uuid).toLowerCase();
+
+  const telegramId = await env.BOT_DB.get(
+    "uuid:" + normalizedUUID
+  );
+
+  if (!telegramId) {
+    throw new Error("UUID is not registered");
+  }
+
+  const rawUser = await env.BOT_DB.get("user:" + telegramId);
+
+  if (!rawUser) {
+    throw new Error("Subscription does not exist");
+  }
+
+  let user;
+
+  try {
+    user = JSON.parse(rawUser);
+  } catch {
+    throw new Error("Invalid subscription record");
+  }
+
+  if (
+    String(user.telegramId) !== String(telegramId) ||
+    String(user.uuid).toLowerCase() !== normalizedUUID
+  ) {
+    throw new Error("Subscription mapping mismatch");
+  }
+
+  if (user.enabled !== true) {
+    throw new Error("Subscription disabled");
+  }
+
+  if (
+    user.expiresAt !== null &&
+    user.expiresAt !== undefined &&
+    Number(user.expiresAt) <= Date.now()
+  ) {
+    throw new Error("Subscription expired");
+  }
+
+  return user;
 }
 
 async function handleVLESS(request, env) {
@@ -453,16 +551,15 @@ async function handleVLESS(request, env) {
   }
 
   if (
-    !env.UUID ||
     !env.RELAY_SECRET ||
     !env.RELAY_HOST ||
     !env.RELAY_PORT ||
+    !env.BOT_DB ||
     env.RELAY_HOST === "SET_AFTER_RAILWAY_DEPLOY"
   ) {
-    return new Response(
-      "Gateway environment is incomplete",
-      { status: 503 }
-    );
+    return new Response("Gateway environment is incomplete", {
+      status: 503
+    });
   }
 
   const pair = new WebSocketPair();
@@ -515,12 +612,15 @@ async function handleVLESS(request, env) {
 
     await socket.opened;
 
-    if (closed) return socket.close();
+    if (closed) {
+      return socket.close();
+    }
 
     writer = socket.writable.getWriter();
 
     const frame = new Uint8Array(
-      2 + secret.length + 2 + host.length + 2 + parsed.payload.length
+      2 + secret.length + 2 + host.length +
+      2 + parsed.payload.length
     );
 
     let offset = 0;
@@ -571,7 +671,9 @@ async function handleVLESS(request, env) {
           return;
         }
 
-        if (data.length) ws.send(data);
+        if (data.length) {
+          ws.send(data);
+        }
       }
     })).catch(err => {
       if (!closed) {
@@ -590,9 +692,8 @@ async function handleVLESS(request, env) {
 
     const parsed = parseVLESS(bytes);
 
-    if (parsed.uuid.toLowerCase() !== String(env.UUID).toLowerCase()) {
-      throw new Error("UUID mismatch");
-    }
+    // UUID must map to an enabled, unexpired KV subscription.
+    await authorizeUUID(env, parsed.uuid);
 
     await connectRelay(parsed);
   }
@@ -608,7 +709,9 @@ async function handleVLESS(request, env) {
     request.headers.get("sec-websocket-protocol")
   );
 
-  if (early?.length) enqueue(early);
+  if (early?.length) {
+    enqueue(early);
+  }
 
   ws.addEventListener("message", event => enqueue(event.data));
   ws.addEventListener("close", closeAll);
@@ -646,7 +749,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         success: true,
-        gateway: "Gateway",
+        gateway: "Trendify Nexus Gateway",
         gateway_id: env.GATEWAY_ID || null,
         region: env.GATEWAY_REGION || "eu",
         status: "online",
@@ -663,11 +766,10 @@ export default {
 };
 `;
 
-/* =========================
-   TELEGRAM BOT WORKER
-========================= */
+/* =====================================================
+   3. TELEGRAM BOT WORKER
+===================================================== */
 
-function_placeholder_to_continue
 const BOT_SOURCE = String.raw`
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -687,13 +789,128 @@ async function sendMessage(env, chatId, text) {
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text })
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: String(text).slice(0, 4000)
+      })
     }
   );
 
-  if (!response.ok) {
-    throw new Error("Telegram sendMessage failed");
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    throw new Error(data.description || "Telegram sendMessage failed");
   }
+
+  return data;
+}
+
+function userKey(id) {
+  return "user:" + String(id);
+}
+
+function uuidKey(uuid) {
+  return "uuid:" + String(uuid).toLowerCase();
+}
+
+async function getUser(env, id) {
+  const value = await env.BOT_DB.get(userKey(id));
+  if (!value) return null;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+async function saveUser(env, user) {
+  await env.BOT_DB.put(
+    userKey(user.telegramId),
+    JSON.stringify(user)
+  );
+
+  await env.BOT_DB.put(
+    uuidKey(user.uuid),
+    String(user.telegramId)
+  );
+}
+
+function dateText(value) {
+  if (value === null || value === undefined) {
+    return "بدون تاریخ انقضا";
+  }
+
+  const date = new Date(Number(value));
+
+  if (Number.isNaN(date.getTime())) {
+    return "تاریخ نامعتبر";
+  }
+
+  return date.toLocaleString("en-GB", {
+    timeZone: "UTC",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short"
+  });
+}
+
+function isExpired(user) {
+  return user.expiresAt !== null &&
+    user.expiresAt !== undefined &&
+    Number(user.expiresAt) <= Date.now();
+}
+
+function helpText() {
+  return [
+    "Trendify Nexus — مدیریت اشتراک",
+    "",
+    "دستورات کاربران:",
+    "/start — شروع",
+    "/id — مشاهده شناسه تلگرام",
+    "/sub — اطلاعات اشتراک",
+    "",
+    "دستورات ادمین:",
+    "/new ID DAYS [LABEL] — ساخت اشتراک",
+    "/users — فهرست کاربران",
+    "/user ID — اطلاعات کاربر",
+    "/disable ID — غیرفعال‌سازی",
+    "/enable ID — فعال‌سازی",
+    "/extend ID DAYS — تمدید",
+    "/delete ID — حذف کامل کاربر",
+    "",
+    "نمونه:",
+    "/new 123456789 30 Customer1"
+  ].join("\n");
+}
+
+function subscriptionText(user) {
+  const status = user.enabled
+    ? (isExpired(user) ? "منقضی‌شده" : "فعال")
+    : "غیرفعال";
+
+  return [
+    "اطلاعات اشتراک",
+    "شناسه تلگرام: " + user.telegramId,
+    "نام: " + (user.label || "بدون نام"),
+    "وضعیت: " + status,
+    "UUID:",
+    user.uuid,
+    "تاریخ ایجاد: " + dateText(user.createdAt),
+    "تاریخ انقضا: " + dateText(user.expiresAt)
+  ].join("\n");
+}
+
+function validTelegramId(value) {
+  return /^\d{1,20}$/.test(String(value || ""));
+}
+
+function validDays(value) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 1 && n <= 3650;
 }
 
 export default {
@@ -703,26 +920,27 @@ export default {
     if (url.pathname === "/") {
       return json({
         success: true,
-        service: "Telegram Bot Webhook"
+        service: "Trendify Nexus Telegram Bot"
       });
     }
 
     if (url.pathname !== "/telegram-webhook") {
-      return new Response("Not Found", { status: 404 });
+      return json({ success: false, message: "Not Found" }, 404);
     }
 
     if (request.method !== "POST") {
-      return new Response("Method Not Allowed", { status: 405 });
+      return json({ success: false, message: "Method Not Allowed" }, 405);
     }
 
     if (
       !env.TELEGRAM_BOT_TOKEN ||
       !env.TELEGRAM_ADMIN_ID ||
       !env.BOT_WEBHOOK_SECRET ||
+      !env.BOT_DB ||
       request.headers.get("X-Telegram-Bot-Api-Secret-Token") !==
         env.BOT_WEBHOOK_SECRET
     ) {
-      return new Response("Unauthorized", { status: 401 });
+      return json({ success: false, message: "Unauthorized" }, 401);
     }
 
     let update;
@@ -730,7 +948,7 @@ export default {
     try {
       update = await request.json();
     } catch {
-      return new Response("Bad Request", { status: 400 });
+      return json({ success: false, message: "Invalid JSON" }, 400);
     }
 
     const message = update.message;
@@ -739,69 +957,326 @@ export default {
       return json({ success: true });
     }
 
-    const command = message.text.trim().split(/\s+/)[0].split("@")[0];
+    const text = message.text.trim();
+    const parts = text.split(/\s+/);
+    const command = (parts[0] || "").split("@")[0].toLowerCase();
     const senderId = String(message.from?.id || "");
     const chatId = message.chat.id;
     const isAdmin = senderId === String(env.TELEGRAM_ADMIN_ID);
 
     try {
       if (command === "/start" || command === "/help") {
-        await sendMessage(
-          env,
-          chatId,
-          isAdmin
-            ? "ربات فعال است. برای راهنما /help را بزن.\nمدیریت کاربران هنوز به API پنل متصل نشده است."
-            : "ربات فعال است. برای دسترسی مدیریتی با مدیر سیستم تماس بگیر."
-        );
-      } else if (command === "/id") {
-        await sendMessage(
-          env,
-          chatId,
-          "Telegram ID: " + senderId
-        );
-      } else if (isAdmin) {
-        await sendMessage(
-          env,
-          chatId,
-          "این ربات هنوز به API پنل متصل نشده است؛ مدیریت کاربران و اشتراک‌ها در دسترس نیست."
-        );
-      } else {
-        await sendMessage(
-          env,
-          chatId,
-          "این دستور در دسترس نیست."
-        );
+        await sendMessage(env, chatId, helpText());
+        return json({ success: true });
       }
-    } catch (err) {
-      console.log("Telegram handler error:", err.message);
+
+      if (command === "/id") {
+        await sendMessage(
+          env,
+          chatId,
+          "شناسه تلگرام شما:\n" + senderId
+        );
+        return json({ success: true });
+      }
+
+      if (command === "/sub") {
+        const targetId = parts[1] && isAdmin
+          ? parts[1]
+          : senderId;
+
+        const user = await getUser(env, targetId);
+
+        await sendMessage(
+          env,
+          chatId,
+          user
+            ? subscriptionText(user)
+            : "اشتراکی برای این شناسه پیدا نشد."
+        );
+
+        return json({ success: true });
+      }
+
+      if (!isAdmin) {
+        await sendMessage(
+          env,
+          chatId,
+          "اجازه اجرای دستورات مدیریتی را ندارید."
+        );
+        return json({ success: true });
+      }
+
+      if (command === "/new") {
+        const targetId = parts[1];
+        const days = parts[2];
+        const label = parts.slice(3).join(" ") || "";
+
+        if (!validTelegramId(targetId) || !validDays(days)) {
+          await sendMessage(
+            env,
+            chatId,
+            "فرمت صحیح:\n/new TELEGRAM_ID DAYS [LABEL]"
+          );
+          return json({ success: true });
+        }
+
+        const existing = await getUser(env, targetId);
+
+        if (existing) {
+          await sendMessage(
+            env,
+            chatId,
+            "این کاربر از قبل وجود دارد. برای تمدید از /extend استفاده کن."
+          );
+          return json({ success: true });
+        }
+
+        const user = {
+          telegramId: String(targetId),
+          label,
+          uuid: crypto.randomUUID(),
+          enabled: true,
+          createdAt: Date.now(),
+          expiresAt: Date.now() + Number(days) * 86400000
+        };
+
+        await saveUser(env, user);
+
+        await sendMessage(
+          env,
+          chatId,
+          "اشتراک ساخته شد.\n\n" + subscriptionText(user)
+        );
+
+        return json({ success: true });
+      }
+
+      if (command === "/users") {
+        const result = await env.BOT_DB.list({
+          prefix: "user:",
+          limit: 100
+        });
+
+        const users = [];
+
+        for (const key of result.keys) {
+          const user = await getUser(
+            env,
+            key.name.slice("user:".length)
+          );
+
+          if (user) {
+            users.push(
+              user.telegramId + " | " +
+              (user.label || "بدون نام") + " | " +
+              (user.enabled && !isExpired(user)
+                ? "فعال"
+                : "غیرفعال/منقضی")
+            );
+          }
+        }
+
+        await sendMessage(
+          env,
+          chatId,
+          users.length
+            ? "کاربران (حداکثر ۱۰۰ مورد):\n\n" + users.join("\n")
+            : "هنوز کاربری ثبت نشده است."
+        );
+
+        return json({ success: true });
+      }
+
+      if (command === "/user") {
+        const targetId = parts[1];
+
+        if (!validTelegramId(targetId)) {
+          await sendMessage(env, chatId, "استفاده: /user TELEGRAM_ID");
+          return json({ success: true });
+        }
+
+        const user = await getUser(env, targetId);
+
+        await sendMessage(
+          env,
+          chatId,
+          user ? subscriptionText(user) : "کاربر پیدا نشد."
+        );
+
+        return json({ success: true });
+      }
+
+      if (command === "/disable" || command === "/enable") {
+        const targetId = parts[1];
+
+        if (!validTelegramId(targetId)) {
+          await sendMessage(
+            env,
+            chatId,
+            "شناسه تلگرام معتبر وارد کن."
+          );
+          return json({ success: true });
+        }
+
+        const user = await getUser(env, targetId);
+
+        if (!user) {
+          await sendMessage(env, chatId, "کاربر پیدا نشد.");
+          return json({ success: true });
+        }
+
+        user.enabled = command === "/enable";
+
+        await saveUser(env, user);
+
+        await sendMessage(
+          env,
+          chatId,
+          command === "/enable"
+            ? "کاربر فعال شد.\n" + subscriptionText(user)
+            : "اشتراک کاربر غیرفعال شد."
+        );
+
+        return json({ success: true });
+      }
+
+      if (command === "/extend") {
+        const targetId = parts[1];
+        const days = parts[2];
+
+        if (!validTelegramId(targetId) || !validDays(days)) {
+          await sendMessage(
+            env,
+            chatId,
+            "استفاده: /extend TELEGRAM_ID DAYS"
+          );
+          return json({ success: true });
+        }
+
+        const user = await getUser(env, targetId);
+
+        if (!user) {
+          await sendMessage(env, chatId, "کاربر پیدا نشد.");
+          return json({ success: true });
+        }
+
+        const currentExpiry = Number(user.expiresAt);
+        const base = Number.isFinite(currentExpiry) &&
+          currentExpiry > Date.now()
+            ? currentExpiry
+            : Date.now();
+
+        user.expiresAt = base + Number(days) * 86400000;
+
+        await saveUser(env, user);
+
+        await sendMessage(
+          env,
+          chatId,
+          "اشتراک تمدید شد.\n" + subscriptionText(user)
+        );
+
+        return json({ success: true });
+      }
+
+      if (command === "/delete") {
+        const targetId = parts[1];
+
+        if (!validTelegramId(targetId)) {
+          await sendMessage(env, chatId, "استفاده: /delete TELEGRAM_ID");
+          return json({ success: true });
+        }
+
+        const user = await getUser(env, targetId);
+
+        if (!user) {
+          await sendMessage(env, chatId, "کاربر پیدا نشد.");
+          return json({ success: true });
+        }
+
+        await env.BOT_DB.delete(uuidKey(user.uuid));
+        await env.BOT_DB.delete(userKey(targetId));
+
+        await sendMessage(
+          env,
+          chatId,
+          "کاربر و نگاشت UUID او حذف شدند."
+        );
+
+        return json({ success: true });
+      }
+
+      await sendMessage(
+        env,
+        chatId,
+        "دستور ناشناخته است.\n/help"
+      );
+    } catch (error) {
+      console.log("BOT ERROR:", error?.message || error);
+
+      try {
+        await sendMessage(
+          env,
+          chatId,
+          "خطای اجرای دستور: " +
+            String(error?.message || "خطای نامشخص").slice(0, 500)
+        );
+      } catch {}
     }
 
     return json({ success: true });
   }
 };
 `;
+/* =====================================================
+   4. CLOUDFLARE WORKER DEPLOYMENT
+===================================================== */
 
 async function deployWorker(
   accountId,
   token,
   workerName,
   source,
-  bindings,
-  secretNames = []
+  bindings = {},
+  secretNames = [],
+  kvNamespaces = []
 ) {
+  const textBindings = Object.entries(bindings).map(
+    ([name, value]) => ({
+      type: secretNames.includes(name)
+        ? "secret_text"
+        : "plain_text",
+      name,
+      text: String(value)
+    })
+  );
+
+  const namespaceBindings = kvNamespaces.map(
+    ({ name, namespaceId }) => ({
+      type: "kv_namespace",
+      name,
+      namespace_id: namespaceId
+    })
+  );
+
   const metadata = {
     main_module: "index.js",
     compatibility_date: "2026-10-10",
-    bindings: Object.entries(bindings).map(([name, value]) => ({
-      type: secretNames.includes(name) ? "secret_text" : "plain_text",
-      name,
-      text: String(value)
-    }))
+    bindings: [
+      ...textBindings,
+      ...namespaceBindings
+    ]
   };
 
   const form = new FormData();
 
-  form.append("metadata", JSON.stringify(metadata));
+  form.append(
+    "metadata",
+    new Blob(
+      [JSON.stringify(metadata)],
+      { type: "application/json" }
+    )
+  );
 
   form.append(
     "index.js",
@@ -812,8 +1287,7 @@ async function deployWorker(
   );
 
   await cf(
-    "/accounts/" + accountId +
-      "/workers/scripts/" + workerName + "/content",
+    `/accounts/${accountId}/workers/scripts/${workerName}`,
     token,
     {
       method: "PUT",
@@ -822,21 +1296,18 @@ async function deployWorker(
   );
 
   await cf(
-    "/accounts/" + accountId +
-      "/workers/scripts/" + workerName + "/subdomain",
+    `/accounts/${accountId}/workers/scripts/${workerName}/subdomain`,
     token,
     {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      method: "POST",
       body: JSON.stringify({ enabled: true })
     }
   );
 }
-/* =========================
-   INSTALLER API
-========================= */
+
+/* =====================================================
+   5. INSTALLER API
+===================================================== */
 
 export default {
   async fetch(request) {
@@ -858,9 +1329,20 @@ export default {
     let workerName = null;
     let botWorkerName = null;
     let repoCreated = false;
+    let namespaceCreated = false;
+    let namespaceId = null;
 
     try {
-      const body = await request.json();
+      let body;
+
+      try {
+        body = await request.json();
+      } catch {
+        return json({
+          success: false,
+          message: "بدنه درخواست JSON معتبر نیست."
+        }, 400);
+      }
 
       const githubToken = String(body.githubToken || "").trim();
       const cloudflareToken = String(body.cloudflareToken || "").trim();
@@ -877,11 +1359,12 @@ export default {
       ) {
         return json({
           success: false,
-          message: "همه فیلدها الزامی هستند و شناسه ادمین تلگرام باید عددی باشد."
+          message:
+            "تمام فیلدها الزامی هستند و شناسه ادمین تلگرام باید عددی باشد."
         }, 400);
       }
 
-      // Validate Cloudflare token
+      /* Validate Cloudflare token */
       const tokenCheck = await cf(
         "/user/tokens/verify",
         cloudflareToken
@@ -891,7 +1374,7 @@ export default {
         throw new Error("Cloudflare API Token فعال نیست.");
       }
 
-      // Validate GitHub token
+      /* Validate GitHub token */
       const userResponse = await github(
         "https://api.github.com/user",
         githubToken
@@ -903,10 +1386,10 @@ export default {
         );
       }
 
-      const user = await userResponse.json();
-      const owner = user.login;
+      const githubUser = await userResponse.json();
+      const owner = githubUser.login;
 
-      // Validate Telegram bot token
+      /* Validate Telegram bot token */
       const telegramCheck = await fetch(
         "https://api.telegram.org/bot" +
           telegramBotToken +
@@ -921,7 +1404,7 @@ export default {
 
       const botUsername = telegramData.result.username;
 
-      // Check Cloudflare workers.dev subdomain
+      /* Verify workers.dev subdomain */
       const accountInfo = await cf(
         "/accounts/" + accountId + "/workers/subdomain",
         cloudflareToken
@@ -935,17 +1418,46 @@ export default {
         );
       }
 
-      // Generate unique names and credentials
-      const repoName = randomHex(6);
-      workerName = randomHex(6);
-      botWorkerName = randomHex(6);
+      /* Generate unique names and secrets */
+      const repoName = "nexus-relay-" + randomHex(5);
+      workerName = "nexus-gw-" + randomHex(5);
+      botWorkerName = "nexus-bot-" + randomHex(5);
 
       const gatewayId = randomHex(6);
       const relaySecret = randomHex(32);
       const webhookSecret = randomHex(32);
-      const uuid = crypto.randomUUID();
 
-      // Create GitHub repository
+      /* Create KV namespace BEFORE deploying Workers */
+      const kvResult = await cf(
+        `/accounts/${accountId}/storage/kv/namespaces`,
+        cloudflareToken,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            title: `nexus-bot-${botWorkerName}`
+          })
+        }
+      );
+
+      namespaceId = kvResult?.id;
+
+      if (!namespaceId) {
+        throw new Error("ساخت فضای ذخیره‌سازی KV ناموفق بود.");
+      }
+
+      namespaceCreated = true;
+
+      const kvNamespaces = [
+        {
+          name: "BOT_DB",
+          namespaceId
+        }
+      ];
+
+      /* Create GitHub repository */
       const createRepo = await github(
         "https://api.github.com/user/repos",
         githubToken,
@@ -956,7 +1468,7 @@ export default {
           },
           body: JSON.stringify({
             name: repoName,
-            description: "Authenticated TCP relay",
+            description: "Trendify Nexus authenticated TCP relay",
             private: false,
             auto_init: true
           })
@@ -971,6 +1483,7 @@ export default {
       }
 
       repoCreated = true;
+
       repository =
         "https://github.com/" + owner + "/" + repoName;
 
@@ -1007,19 +1520,20 @@ export default {
       }, null, 2);
 
       const readme = [
-        "# Authenticated TCP Relay",
+        "# Trendify Nexus TCP Relay",
         "",
-        "## Required environment variables",
+        "## Required Railway variables",
         "- PORT=443",
-        "- RELAY_SECRET: configure in Railway variables; do not commit it.",
+        "- RELAY_SECRET: use the value returned by the Installer.",
         "",
         "## Deployment",
         "1. Deploy this repository to Railway.",
         "2. Set PORT=443 and RELAY_SECRET in Railway variables.",
         "3. Create a Railway TCP Proxy targeting internal port 443.",
-        "4. Configure RELAY_HOST and RELAY_PORT in the Gateway.",
+        "4. Copy the public TCP hostname and port.",
+        "5. Configure RELAY_HOST and RELAY_PORT in the Gateway Worker.",
         "",
-        "Railway service and TCP Proxy creation are manual."
+        "Never publish RELAY_SECRET."
       ].join("\n");
 
       const files = {
@@ -1040,24 +1554,24 @@ export default {
         );
       }
 
-      // Deploy Gateway
+      /* Deploy Gateway with KV binding */
       await deployWorker(
         accountId,
         cloudflareToken,
         workerName,
         GATEWAY_SOURCE,
         {
-          UUID: uuid,
           RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
           RELAY_PORT: "443",
           RELAY_SECRET: relaySecret,
           GATEWAY_ID: gatewayId,
           GATEWAY_REGION: "eu"
         },
-        ["RELAY_SECRET"]
+        ["RELAY_SECRET"],
+        kvNamespaces
       );
 
-      // Deploy Telegram Worker
+      /* Deploy Telegram bot with the SAME KV namespace */
       await deployWorker(
         accountId,
         cloudflareToken,
@@ -1071,7 +1585,8 @@ export default {
         [
           "TELEGRAM_BOT_TOKEN",
           "BOT_WEBHOOK_SECRET"
-        ]
+        ],
+        kvNamespaces
       );
 
       const workerUrl =
@@ -1082,7 +1597,7 @@ export default {
         "https://" + botWorkerName +
         "." + subdomain + ".workers.dev";
 
-      // Configure Telegram webhook
+      /* Configure Telegram webhook */
       const webhookResponse = await fetch(
         "https://api.telegram.org/bot" +
           telegramBotToken +
@@ -1104,23 +1619,22 @@ export default {
 
       if (!webhookResponse.ok || !webhookData.ok) {
         throw new Error(
-          "ساخت Worker انجام شد، اما تنظیم Webhook ناموفق بود: " +
+          "Workerها ساخته شدند، اما تنظیم Webhook ناموفق بود: " +
             (webhookData.description || "خطای نامشخص")
         );
       }
 
       return json({
         success: true,
-        message:
-          "مخزن GitHub، Gateway و Worker ربات تلگرام ساخته شدند.",
+        message: "Installer با موفقیت اجرا شد.",
         repository,
         workerName,
         workerUrl,
         gatewayId,
-        uuid,
         botWorkerName,
         botWorkerUrl,
         botUsername,
+        kvNamespaceId: namespaceId,
         requiredRailwayVariables: {
           PORT: "443",
           RELAY_SECRET: relaySecret
@@ -1129,19 +1643,31 @@ export default {
           RELAY_HOST: "Railway TCP Proxy hostname, without port",
           RELAY_PORT: "Railway TCP Proxy public port"
         },
+        nextSteps: [
+          "مخزن GitHub را در Railway مستقر کن.",
+          "PORT و RELAY_SECRET را در Railway تنظیم کن.",
+          "برای پورت داخلی 443 یک TCP Proxy بساز.",
+          "مقادیر RELAY_HOST و RELAY_PORT را در Gateway Worker تنظیم کن.",
+          "در ربات تلگرام دستور /help را بزن.",
+          "برای ساخت اشتراک از /new TELEGRAM_ID DAYS استفاده کن."
+        ],
         note:
-          "Railway و TCP Proxy هنوز باید جداگانه تنظیم شوند. " +
-          "ربات هنوز به API مدیریت کاربران و اشتراک‌ها متصل نیست."
+          "ساخت Railway service و TCP Proxy همچنان دستی است. " +
+          "Gateway از KV برای کنترل وضعیت اشتراک و UUID استفاده می‌کند."
       });
 
     } catch (error) {
+      console.log("INSTALLER ERROR:", error?.message || error);
+
       return json({
         success: false,
         message: error?.message || "Installer failed.",
         repositoryMayHaveBeenCreated: repoCreated,
         repository,
         workerName,
-        botWorkerName
+        botWorkerName,
+        kvNamespaceCreated: namespaceCreated,
+        kvNamespaceId: namespaceId
       }, 500);
     }
   }
