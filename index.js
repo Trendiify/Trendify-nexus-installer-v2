@@ -878,14 +878,14 @@ export default {
         workerName,
         GATEWAY_SOURCE,
         {
-          UUID: uuid,
-          RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
-          RELAY_PORT: "443",
-          RELAY_SECRET: relaySecret,
-          GATEWAY_ID: gatewayId,
-          GATEWAY_REGION: "eu",
-        },
-        ["RELAY_SECRET"]
+  UUID: uuid,
+  RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
+  RELAY_PORT: "443",
+  RELAY_SECRET: relaySecret,
+  GATEWAY_ID: gatewayId,
+  GATEWAY_REGION: "eu",
+},
+["UUID", "RELAY_SECRET"]
       );
 
       /* Deploy Telegram Worker */
