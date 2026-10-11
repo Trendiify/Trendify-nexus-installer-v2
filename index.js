@@ -47,6 +47,7 @@ async function github(url, token, options = {}) {
   });
 }
 
+```js
 async function cf(path, token, options = {}) {
   const response = await fetch(
     "https://api.cloudflare.com/client/v4" + path,
@@ -65,7 +66,10 @@ async function cf(path, token, options = {}) {
   try {
     data = JSON.parse(raw);
   } catch {
-    data = { success: false, errors: [{ message: raw }] };
+    data = {
+      success: false,
+      errors: [{ message: raw }],
+    };
   }
 
   if (!response.ok || data.success === false) {
@@ -73,11 +77,30 @@ async function cf(path, token, options = {}) {
       .map(x => x.message || JSON.stringify(x))
       .join("; ");
 
-    throw new Error("Cloudflare API: " + (details || response.status));
+    throw new Error(
+      "Cloudflare API: " + (details || response.status)
+    );
+  }
+
+  // بررسی خطاهای داخلی نتیجه کوئری D1
+  if (Array.isArray(data.result)) {
+    const failedQuery = data.result.find(
+      item => item && item.success === false
+    );
+
+    if (failedQuery) {
+      throw new Error(
+        "Cloudflare D1 query: " +
+        (failedQuery.error ||
+          failedQuery.message ||
+          "Query execution failed")
+      );
+    }
   }
 
   return data.result;
 }
+```
 
 async function putRepoFile(owner, repo, path, content, token) {
   const url =
@@ -478,21 +501,36 @@ async function handleVLESS(request, env) {
 
     const parsed = parseVLESS(bytes);
 
-        const user = await env.DB.prepare(
-      `SELECT uuid, enabled, expires_at
-       FROM users
-       WHERE uuid = ?
-       LIMIT 1`
-    ).bind(parsed.uuid.toLowerCase()).first();
+        ```js
+    let user;
+
+    try {
+      if (!env.DB) {
+        throw new Error("D1 database binding DB is missing");
+      }
+
+      user = await env.DB.prepare(
+        `SELECT uuid, enabled, expires_at
+         FROM users
+         WHERE uuid = ?
+         LIMIT 1`
+      ).bind(parsed.uuid.toLowerCase()).first();
+    } catch (err) {
+      console.log("D1 AUTH ERROR:", err.message);
+      throw new Error("User authentication database unavailable");
+    }
 
     if (
       !user ||
       Number(user.enabled) !== 1 ||
-      (user.expires_at != null &&
-       Number(user.expires_at) <= Math.floor(Date.now() / 1000))
+      (
+        user.expires_at != null &&
+        Number(user.expires_at) <= Math.floor(Date.now() / 1000)
+      )
     ) {
       throw new Error("User missing, disabled, or expired");
     }
+```
 
     await connectRelay(parsed);
   }
@@ -583,12 +621,13 @@ async function sendMessage(env, chatId, text) {
   if (!response.ok) throw new Error("Telegram sendMessage failed");
 }
 
+```js
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
-      return json({ success: true, service: "Telegram Bot Webhook" });
+      return json({ success: true, service: "Trendify Nexus Bot" });
     }
 
     if (url.pathname !== "/telegram-webhook") {
@@ -603,7 +642,8 @@ export default {
       !env.TELEGRAM_BOT_TOKEN ||
       !env.TELEGRAM_ADMIN_ID ||
       !env.BOT_WEBHOOK_SECRET ||
-      request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.BOT_WEBHOOK_SECRET
+      request.headers.get("X-Telegram-Bot-Api-Secret-Token") !==
+        env.BOT_WEBHOOK_SECRET
     ) {
       return new Response("Unauthorized", { status: 401 });
     }
@@ -620,10 +660,11 @@ export default {
       return json({ success: true });
     }
 
-    const command = message.text.trim().split(/\s+/)[0].split("@")[0];
-    const senderId = String(message.from?.id || "");
     const chatId = message.chat.id;
+    const senderId = String(message.from?.id || "");
     const isAdmin = senderId === String(env.TELEGRAM_ADMIN_ID);
+    const parts = message.text.trim().split(/\s+/);
+    const command = (parts[0] || "").split("@")[0];
 
     try {
       if (command === "/start" || command === "/help") {
@@ -631,28 +672,142 @@ export default {
           env,
           chatId,
           isAdmin
-            ? "ربات فعال است. برای راهنما /help را بزن.\\nمدیریت کاربران هنوز به API پنل متصل نشده است."
-            : "ربات فعال است. برای دسترسی مدیریتی با مدیر سیستم تماس بگیر."
+            ? [
+                "Trendify Nexus — مدیریت کاربران",
+                "",
+                "/new NAME DAYS — ساخت کاربر",
+                "/users — فهرست کاربران",
+                "/disable UUID — غیرفعال‌سازی",
+                "/enable UUID — فعال‌سازی",
+                "/delete UUID — حذف کاربر",
+                "/id — شناسه تلگرام"
+              ].join("\n")
+            : "ربات فعال است. برای دریافت دسترسی با مدیر تماس بگیر."
         );
       } else if (command === "/id") {
         await sendMessage(env, chatId, "Telegram ID: " + senderId);
-      } else if (isAdmin) {
+      } else if (!isAdmin) {
+        await sendMessage(env, chatId, "اجازه اجرای این دستور را نداری.");
+      } else if (!env.DB) {
+        await sendMessage(env, chatId, "خطا: دیتابیس D1 متصل نیست.");
+      } else if (command === "/new") {
+        const name = parts[1];
+        const days = Number(parts[2]);
+
+        if (
+          !name ||
+          name.length > 40 ||
+          !Number.isInteger(days) ||
+          days < 1 ||
+          days > 3650
+        ) {
+          await sendMessage(
+            env,
+            chatId,
+            "فرمت صحیح: /new NAME DAYS\nمثال: /new Ali 30"
+          );
+        } else {
+          const uuid = crypto.randomUUID().toLowerCase();
+          const now = Math.floor(Date.now() / 1000);
+          const expiresAt = now + days * 86400;
+
+          await env.DB.prepare(
+            `INSERT INTO users
+             (uuid, telegram_id, name, enabled, expires_at, created_at)
+             VALUES (?, ?, ?, 1, ?, ?)`
+          ).bind(uuid, senderId, name, expiresAt, now).run();
+
+          const gatewayHost = String(env.GATEWAY_HOST || "").trim();
+
+          const config = gatewayHost
+            ? "vless://" + uuid + "@" + gatewayHost +
+              ":443?encryption=none&security=tls&type=ws&host=" +
+              encodeURIComponent(gatewayHost) +
+              "&path=%2Fws#" + encodeURIComponent(name)
+            : "UUID: " + uuid;
+
+          await sendMessage(
+            env,
+            chatId,
+            "کاربر ساخته شد.\nنام: " + name +
+            "\nانقضا: " + new Date(expiresAt * 1000).toISOString() +
+            "\n" + config
+          );
+        }
+      } else if (command === "/users") {
+        const result = await env.DB.prepare(
+          `SELECT uuid, name, enabled, expires_at
+           FROM users ORDER BY created_at DESC LIMIT 50`
+        ).all();
+
+        const rows = result.results || [];
+
         await sendMessage(
           env,
           chatId,
-          "این ربات هنوز به API پنل متصل نشده است؛ مدیریت کاربران و اشتراک‌ها در دسترس نیست."
+          rows.length
+            ? rows.map(u =>
+                u.name + " | " + u.uuid +
+                " | " + (Number(u.enabled) === 1 ? "فعال" : "غیرفعال") +
+                " | " + (
+                  u.expires_at == null
+                    ? "بدون انقضا"
+                    : new Date(Number(u.expires_at) * 1000).toISOString()
+                )
+              ).join("\n")
+            : "کاربری ثبت نشده است."
         );
+      } else if (
+        command === "/disable" ||
+        command === "/enable"
+      ) {
+        const uuid = String(parts[1] || "").toLowerCase();
+
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
+          await sendMessage(env, chatId, "UUID معتبر وارد کن.");
+        } else {
+          const enabled = command === "/enable" ? 1 : 0;
+
+          const result = await env.DB.prepare(
+            "UPDATE users SET enabled = ? WHERE uuid = ?"
+          ).bind(enabled, uuid).run();
+
+          await sendMessage(
+            env,
+            chatId,
+            result.meta?.changes
+              ? (enabled ? "کاربر فعال شد." : "کاربر غیرفعال شد.")
+              : "کاربر پیدا نشد."
+          );
+        }
+      } else if (command === "/delete") {
+        const uuid = String(parts[1] || "").toLowerCase();
+
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
+          await sendMessage(env, chatId, "UUID معتبر وارد کن.");
+        } else {
+          const result = await env.DB.prepare(
+            "DELETE FROM users WHERE uuid = ?"
+          ).bind(uuid).run();
+
+          await sendMessage(
+            env,
+            chatId,
+            result.meta?.changes ? "کاربر حذف شد." : "کاربر پیدا نشد."
+          );
+        }
       } else {
-        await sendMessage(env, chatId, "این دستور در دسترس نیست.");
+        await sendMessage(env, chatId, "دستور ناشناخته است. /help");
       }
     } catch (err) {
-      console.log("Telegram handler error:", err.message);
+      console.log("Bot error:", err.message);
+      await sendMessage(env, chatId, "خطا در اجرا: " + err.message);
     }
 
     return json({ success: true });
   }
 };
-`;
+```
 
 /* =========================
    CLOUDFLARE WORKER DEPLOY
@@ -676,10 +831,10 @@ async function deployWorker(
       value.id
     ) {
       return {
-        type: "d1",
-        name,
-        id: String(value.id),
-      };
+  type: "d1",
+  name,
+  database_id: String(value.id),
+};
     }
 
     // Text and secret bindings
@@ -858,7 +1013,8 @@ export default {
         }
       );
 
-      const databaseId = databaseResult.uuid || databaseResult.id;
+      const databaseId =
+  databaseResult?.uuid || databaseResult?.id;
 
       if (!databaseId) {
         throw new Error("ساخت دیتابیس D1 ناموفق بود؛ شناسه دیتابیس دریافت نشد.");
@@ -892,27 +1048,32 @@ export default {
         }
       );
 ```
-            await cf(
+```js
+      /* Register initial UUID in D1 */
+      await cf(
         "/accounts/" + accountId + "/d1/database/" +
           databaseId + "/query",
         cloudflareToken,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+          },
           body: JSON.stringify({
             sql: `INSERT OR IGNORE INTO users
-                  (uuid, telegram_id, name, enabled, expires_at, created_at)
-                  VALUES (?, ?, ?, 1, NULL, ?)`,
+              (uuid, telegram_id, name, enabled, expires_at, created_at)
+              VALUES (?, ?, ?, 1, NULL, ?)`,
             params: [
               uuid.toLowerCase(),
               telegramAdminId,
               "Initial",
-              Math.floor(Date.now() / 1000)
-            ]
-          })
+              Math.floor(Date.now() / 1000),
+            ],
+          }),
         }
       );
-
+```
+    
       /* Create GitHub repository */
       const createRepo = await github(
         "https://api.github.com/user/repos",
@@ -994,24 +1155,29 @@ export default {
         await putRepoFile(owner, repoName, path, content, githubToken);
       }
 
-      /* Deploy Gateway; secret is a secret binding */
+     ```js
+      /* Deploy Gateway with D1 and secret bindings */
       await deployWorker(
         accountId,
         cloudflareToken,
         workerName,
         GATEWAY_SOURCE,
-       {
-  UUID: uuid,
-  RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
-  RELAY_PORT: "443",
-  RELAY_SECRET: relaySecret,
-  GATEWAY_ID: gatewayId,
-  GATEWAY_REGION: "eu",
-  DB: { type: "d1", id: databaseId },
-},
-["UUID", "RELAY_SECRET"]
+        {
+          UUID: uuid,
+          RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
+          RELAY_PORT: "443",
+          RELAY_SECRET: relaySecret,
+          GATEWAY_ID: gatewayId,
+          GATEWAY_REGION: "eu",
+          DB: {
+            type: "d1",
+            id: databaseId,
+          },
+        },
+        ["UUID", "RELAY_SECRET"]
       );
-
+```
+      ```js
       /* Deploy Telegram Worker */
       await deployWorker(
         accountId,
@@ -1022,9 +1188,20 @@ export default {
           TELEGRAM_BOT_TOKEN: telegramBotToken,
           TELEGRAM_ADMIN_ID: telegramAdminId,
           BOT_WEBHOOK_SECRET: webhookSecret,
+
+          // اتصال دیتابیس مشترک کاربران و اشتراک‌ها
+          DB: {
+            type: "d1",
+            id: databaseId,
+          },
+
+          // آدرس Gateway برای ساخت کانفیگ
+          GATEWAY_HOST:
+            workerName + "." + subdomain + ".workers.dev",
         },
         ["TELEGRAM_BOT_TOKEN", "BOT_WEBHOOK_SECRET"]
       );
+```
 
       const workerUrl =
         "https://" + workerName + "." + subdomain + ".workers.dev";
