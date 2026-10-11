@@ -47,7 +47,7 @@ async function github(url, token, options = {}) {
   });
 }
 
-```js
+
 async function cf(path, token, options = {}) {
   const response = await fetch(
     "https://api.cloudflare.com/client/v4" + path,
@@ -100,7 +100,7 @@ async function cf(path, token, options = {}) {
 
   return data.result;
 }
-```
+
 
 async function putRepoFile(owner, repo, path, content, token) {
   const url =
@@ -501,7 +501,7 @@ async function handleVLESS(request, env) {
 
     const parsed = parseVLESS(bytes);
 
-        ```js
+       
     let user;
 
     try {
@@ -530,7 +530,7 @@ async function handleVLESS(request, env) {
     ) {
       throw new Error("User missing, disabled, or expired");
     }
-```
+
 
     await connectRelay(parsed);
   }
@@ -621,7 +621,7 @@ async function sendMessage(env, chatId, text) {
   if (!response.ok) throw new Error("Telegram sendMessage failed");
 }
 
-```js
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -807,13 +807,13 @@ export default {
     return json({ success: true });
   }
 };
-```
+
 
 /* =========================
    CLOUDFLARE WORKER DEPLOY
 ========================= */
 
-```js
+
 async function deployWorker(
   accountId,
   token,
@@ -893,7 +893,7 @@ async function deployWorker(
     }
   );
 }
-```
+
 
 /* =========================
    INSTALLER API
@@ -996,7 +996,7 @@ export default {
       const webhookSecret = randomHex(32);
       const uuid = crypto.randomUUID();
 
-      ```js
+     
       /* Create shared D1 database for users and subscriptions */
       const databaseName = "nexus-" + randomHex(6);
 
@@ -1047,8 +1047,8 @@ export default {
           body: JSON.stringify({ sql: schemaSql })
         }
       );
-```
-```js
+
+
       /* Register initial UUID in D1 */
       await cf(
         "/accounts/" + accountId + "/d1/database/" +
@@ -1072,7 +1072,7 @@ export default {
           }),
         }
       );
-```
+
     
       /* Create GitHub repository */
       const createRepo = await github(
@@ -1155,7 +1155,7 @@ export default {
         await putRepoFile(owner, repoName, path, content, githubToken);
       }
 
-     ```js
+     
       /* Deploy Gateway with D1 and secret bindings */
       await deployWorker(
         accountId,
@@ -1176,8 +1176,8 @@ export default {
         },
         ["UUID", "RELAY_SECRET"]
       );
-```
-      ```js
+
+     
       /* Deploy Telegram Worker */
       await deployWorker(
         accountId,
@@ -1201,7 +1201,7 @@ export default {
         },
         ["TELEGRAM_BOT_TOKEN", "BOT_WEBHOOK_SECRET"]
       );
-```
+
 
       const workerUrl =
         "https://" + workerName + "." + subdomain + ".workers.dev";
@@ -1253,7 +1253,8 @@ export default {
         },
         note:
           "Railway و TCP Proxy هنوز باید جداگانه تنظیم شوند. " +
-          "ربات تلگرام فعلاً به API مدیریت کاربران و اشتراک‌ها متصل نیست.",
+          "مدیریت کاربران ربات از طریق دیتابیس D1 انجام می‌شود. " +
+"برای اتصال واقعی Gateway، تنظیم Railway و TCP Proxy ضروری است."
       });
     } catch (error) {
       return json({
