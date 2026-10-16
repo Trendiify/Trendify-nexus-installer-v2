@@ -120,6 +120,38 @@ async function putRepoFile(owner, repo, path, content, token) {
   }
 }
 
+async function fetchRelaySource() {
+  const url =
+    "https://raw.githubusercontent.com/Trendiify/Trendify-nexus-relay/main/server.js";
+
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "text/plain"
+    },
+    signal: AbortSignal.timeout(15000)
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch Relay source: HTTP ${response.status}`
+    );
+  }
+
+  const source = await response.text();
+
+  if (
+    !source.includes('node:net') ||
+    !source.includes('RELAY_SECRET') ||
+    !source.includes('server.listen')
+  ) {
+    throw new Error(
+      "Downloaded Relay source failed validation"
+    );
+  }
+
+  return source;
+}
+
 /* =====================================================
    1. AUTHENTICATED TCP RELAY
 ===================================================== */
@@ -1536,8 +1568,20 @@ export default {
         "Never publish RELAY_SECRET."
       ].join("\n");
 
+            const relaySource = await fetchRelaySource();
+
+      if (
+        !relaySource.includes('client.write(Buffer.from([0]))') ||
+        !relaySource.includes('timingSafeEqual') ||
+        !relaySource.includes('RELAY_SECRET')
+      ) {
+        throw new Error(
+          "Relay source is incompatible with the current Gateway protocol."
+        );
+      }
+
       const files = {
-        "server.js": RELAY_SOURCE,
+        "server.js": relaySource,
         "package.json": packageJson,
         "Dockerfile": dockerfile,
         "railway.json": railwayJson,
